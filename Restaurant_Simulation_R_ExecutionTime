@@ -1,0 +1,105 @@
+library(simmer)
+library(dplyr)
+
+# Define customer class with attributes
+Customer <- R6Class("Customer",
+                    public = list(
+                      arrival_time = NULL,
+                      order_size = NULL,
+                      is_takeout = NULL,
+                      wait_start = NULL
+                    ))
+
+# Define events for simulation flow
+arrival <- function(env, customers, queue, order_point, kitchen, tables, arrival_rate) {
+  simmer::trajectory() %>%
+    simmer::timeout(function() rpois(1, arrival_rate)) %>%
+    simmer::set_attribute("arrival_time", simmer::now(env)) %>%
+    simmer::set_attribute("order_size", sample(1:3, 1)) %>%
+    simmer::set_attribute("is_takeout", sample(c(TRUE, FALSE), 1)) %>%
+    simmer::set_attribute("wait_start", NULL) %>%
+    simmer::set_global("customers", customers) %>%
+    simmer::set_global("queue", queue) %>%
+    simmer::set_global("order_point", order_point) %>%
+    simmer::set_global("kitchen", kitchen) %>%
+    simmer::set_global("tables", tables) %>%
+    simmer::trap(function() {
+      customer <- simmer::get_mon_attributes(.trj)[[1]]
+      customers <<- list.append(customers, list(customer))
+      if (customer$is_takeout) {
+        queue <<- list.append(queue, list(customer))
+        simmer::seize("order_point", 1)
+        simmer::release("order_point", 1)
+      } else {
+        if (length(tables) < 200) {
+          tables <<- list.append(tables, list(customer))
+          customer$wait_start <- simmer::now(env)
+          simmer::seize("order_point", 1)
+          simmer::release("order_point", 1)
+        } else {
+          cat(paste("Customer arrived at ", simmer::now(env), " (dine-in) but left due to no tables\n"))
+        }
+      }
+    })
+}
+
+order <- function(env, customer, order_point) {
+  simmer::trap(function() {
+    simmer::timeout(function() rexp(1, 1/service_rate))
+    simmer::seize("order_point", 1)
+    simmer::release("order_point", 1)
+  })
+}
+
+kitchen <- function(env, order_point, cook_time, stations) {
+  simmer::trap(function() {
+    customer <- simmer::get_queue_size("order_point")
+    available_stations <- stations - simmer::get_queue_size("kitchen")
+    if (available_stations > 0) {
+      simmer::timeout(cook_time * customer)
+      if (!customer$is_takeout) {
+        tables <<- tables[!tables %in% list(customer)]
+        customer$wait_time <- simmer::now(env) - customer$wait_start
+      }
+    } else {
+      simmer::trap(kitchen)
+    }
+  })
+}
+
+run_simulation <- function(env, duration, arrival_rate, service_rate, cook_time) {
+  customers <- list()
+  queue <- list()
+  tables <- list()
+  order_point <- simmer::trajectory()
+  order_point <- simmer::add_resource(order_point, "order_point", 10)
+  kitchen <- simmer::trajectory()
+  kitchen <- simmer::add_resource(kitchen, "kitchen", 15)
+  simmer::add_generator(env, "arrival", arrival, env, customers, queue, order_point, kitchen, tables, arrival_rate)
+  simmer::run(env, until = duration)
+  total_wait_time <- sum(sapply(customers, function(customer) if (!is.null(customer$wait_time)) customer$wait_time else 0))
+  average_wait_time <- total_wait_time / length(customers)
+  customers_left <- sum(sapply(customers, function(customer) if (!customer$is_takeout && is.null(customer$wait_start)) 1 else 0))
+  return(c(average_wait_time, customers_left))
+}
+
+# Set parameters for benchmarking
+num_simulations <- 100
+arrival_rate <- 2
+service_rate <- 5
+cook_time <- 2
+duration <- 120
+
+# Perform benchmarking
+r_execution_times <- numeric(num_simulations)
+for (i in 1:num_simulations) {
+  env <- simmer::simmer()
+  start_time <- Sys.time()
+  run_simulation(env, duration, arrival_rate, service_rate, cook_time)
+  end_time <- Sys.time()
+  r_execution_times[i] <- end_time - start_time
+}
+
+# Calculate average execution time
+average_r_execution_time <- mean(r_execution_times)
+cat(sprintf("Average execution time for R simulation (over %d simulations): %.4f seconds\n", num_simulations, average_r_execution_time))
